@@ -1,0 +1,1226 @@
+/* =========================================================
+   VOXLOOP STUDIO — STEP 4: PITCH CORRECTION (UI)
+   Needs pitchcorrect.js (window.VLTune) and the shared state
+   that script.js exposes as window.VLState.
+   ========================================================= */
+
+document.addEventListener("DOMContentLoaded", () => {
+
+    const $ = (id) => document.getElementById(id);
+
+    const section = $("tune-section");
+    const continueButton = $("continue-tune-button");
+    const rootSelect = $("tune-root");
+    const scaleSelect = $("tune-scale");
+    const keyNote = $("tune-key-note");
+    const refValue = $("tune-ref");
+    const refNote = $("tune-ref-note");
+    const strengthSlider = $("tune-strength");
+    const retuneSlider = $("tune-retune");
+    const flattenSlider = $("tune-flatten");
+    const testBox = $("tune-test");
+    const shiftSlider = $("tune-shift");
+    const autoKeyBox = $("tune-auto-key");
+    const phraseBox = $("tune-phrases");
+    const autoNote = $("tune-auto-note");
+    const runButton = $("tune-run-button");
+    const statusLine = $("tune-status");
+    const results = $("tune-results");
+    const statsBody = $("tune-stats-body");
+    const resultNote = $("tune-result-note");
+    const canvas = $("tune-contour");
+    const scrollSlider = $("tune-scroll");
+    const playButtons = document.querySelectorAll("[data-tune-play]");
+    const stopButton = $("tune-stop");
+    const downloadLink = $("tune-download");
+
+    if (!section || !window.VLTune) return;
+
+    const NOTE_NAMES = window.VLTune.noteNames;
+    const S = window.VLState;
+
+    let beatTuningCents = 0;
+    let lastResult = null;
+    let audioBuffers = {};          // original / detuned / tuned as AudioBuffers
+    let running = false;
+
+    NOTE_NAMES.forEach((name, i) => {
+        const option = document.createElement("option");
+        option.value = i;
+        option.textContent = name;
+        rootSelect.appendChild(option);
+    });
+
+    // -----------------------------------------------------
+    // Slider read-outs
+    // -----------------------------------------------------
+
+    function bindReadout(slider, outputId, format) {
+        const out = $(outputId);
+        const update = () => { out.textContent = format(parseFloat(slider.value)); };
+        slider.addEventListener("input", update);
+        update();
+        return update;
+    }
+
+    bindReadout(strengthSlider, "tune-strength-value", v => `${Math.round(v)}%`);
+    bindReadout(retuneSlider, "tune-retune-value", v => (v === 0 ? "Instant" : `${Math.round(v)} ms`));
+    bindReadout(flattenSlider, "tune-flatten-value", v => `${Math.round(v)}%`);
+    // 0 means "let Voxloop Studio decide" only while the automatic key match is ticked; otherwise it means no move at all
+    const updateShiftReadout = bindReadout(shiftSlider, "tune-shift-value", v => (v === 0 ? (autoKeyBox.checked ? "0 (automatic)" : "0 (no move)") : `${v > 0 ? "+" : ""}${Math.round(v)} semitone${Math.abs(v) === 1 ? "" : "s"}`));
+    autoKeyBox.addEventListener("change", updateShiftReadout);
+
+    // -----------------------------------------------------
+    // Open the step
+    // -----------------------------------------------------
+
+    continueButton.addEventListener("click", () => {
+
+        section.classList.remove("hidden");
+        section.scrollIntoView({ behavior: "smooth", block: "start" });
+
+        const key = S && S.beatKey;
+
+        if (key && key.key) {
+            rootSelect.value = String(NOTE_NAMES.indexOf(key.key));
+            scaleSelect.value = key.scale.toLowerCase();
+            keyNote.textContent = key.source === "Beat Lab"
+                ? "From the Beat Lab · exact"
+                : `Detected from the beat · ${Math.round(key.confidence * 100)}% confidence`;
+
+            // Moving a whole vocal is a big step, so only default it on when the key reading is trustworthy.
+            // (Confidence is now the margin between the best seven-note set and the runner-up: wrong readings score under 0.2.)
+            const sure = key.confidence >= 0.45;
+            autoKeyBox.checked = sure;
+            autoNote.textContent = sure ? "" : "Off for now because the beat's key reading is not certain. Check the key above, then tick this.";
+        } else {
+            autoKeyBox.checked = false;
+            autoNote.textContent = "Off because the key is not known yet.";
+            keyNote.textContent = "Key not detected yet. Choose it by hand.";
+        }
+
+        updateShiftReadout();
+
+        // How far the beat's tuning is from A = 440 Hz.
+        try {
+            // The Music Brain key engine already measured the beat's tuning on its pitched (harmonic) sound, ignoring drums.
+            const bk = S && S.beatKey;
+            const t = (bk && bk.tuningStrength != null && bk.engine && bk.source !== "Beat Lab")
+                ? { cents: bk.tuningRaw, strength: bk.tuningStrength }
+                : window.VLTune.estimateBeatTuning(S.beatBuffer);
+            if (t.strength >= 0.35) {
+                beatTuningCents = t.cents;
+                refValue.textContent = `${t.cents >= 0 ? "+" : ""}${t.cents.toFixed(0)} cents`;
+                refNote.textContent = "The vocal is tuned to the beat, not to A = 440";
+            } else {
+                beatTuningCents = 0;
+                refValue.textContent = "A = 440";
+                refNote.textContent = "Beat tuning unclear, using standard";
+            }
+        } catch (error) {
+            console.error(error);
+            beatTuningCents = 0;
+            refValue.textContent = "A = 440";
+            refNote.textContent = "Could not measure the beat tuning";
+        }
+    });
+
+    // The vocal was cleaned up or re-timed after pitch correction ran: that result is out of date.
+    window.addEventListener("vl-prep-changed", () => {
+        if (!lastResult) return;
+        lastResult = null;
+        if (S) S.tunedVocal = null;
+        results.classList.add("hidden");
+        statusLine.textContent = "The vocal changed in the clean-up step. Run pitch correction again.";
+    });
+
+    // -----------------------------------------------------
+    // Run
+    // -----------------------------------------------------
+
+    runButton.addEventListener("click", async () => {
+
+        if (running || !S || !S.vocalBuffer) return;
+
+        running = true;
+        runButton.disabled = true;
+        stopPitchPlayback();
+        statusLine.textContent = "Starting…";
+
+        const vocal = S.preparedVocal || S.vocalBuffer;     // the cleaned-up vocal when step 4 changed it
+        const channels = [];
+        for (let c = 0; c < vocal.numberOfChannels; c++) channels.push(vocal.getChannelData(c));
+
+        const selectiveBox = $("tune-selective");
+        const spokenBox = $("tune-spoken");
+        const naturalBox = $("tune-natural");
+
+        // Auto: speed, strength, vibrato flattening and how picky "selective" is come from the beat's style and this voice (mixbrain.js)
+        let autoTune = null;
+        const autoTuneBox = $("tune-auto");
+        if (autoTuneBox && autoTuneBox.checked && window.VLMixBrain && window.VLMixBrain.ready() && S.beatBuffer) {
+            try {
+                statusLine.textContent = "Listening to your beat and vocal to set the tuning…";
+                const styleSel = document.getElementById("mix-style");
+                const ctx = await window.VLMixBrain.profile(S, { beat: S.beatBuffer, vocal, styleId: styleSel ? styleSel.value : "auto", key: { rootPc: parseInt(rootSelect.value, 10), scale: scaleSelect.value } });
+                if (ctx) {
+                    autoTune = window.VLMixBrain.tune(ctx);
+                    const setSlider = (el, v) => { el.value = String(v); el.dispatchEvent(new Event("input")); };
+                    setSlider(strengthSlider, autoTune.strength); setSlider(retuneSlider, autoTune.retuneMs); setSlider(flattenSlider, autoTune.flatten);
+                    const why = $("tune-auto-why"); if (why) why.textContent = autoTune.notes.join(" ");
+                }
+            } catch (error) { console.error("Auto tune settings failed, using the sliders as they are:", error); autoTune = null; }
+        }
+        const options = {
+            rootPc: parseInt(rootSelect.value, 10),
+            scale: scaleSelect.value,
+            refCents: beatTuningCents,
+            strength: Math.min(parseFloat(strengthSlider.value) / 100, (S.autopilotTuneCap != null ? S.autopilotTuneCap : 100) / 100),   // Autopilot can cap it (a mixed sing/rap line is tuned more gently)
+            retuneMs: parseFloat(retuneSlider.value),
+            minRetuneMs: parseFloat(retuneSlider.value),          // the slider is the speed: no hidden minimum
+            flatten: parseFloat(flattenSlider.value) / 100,
+            manualSemitones: parseInt(shiftSlider.value, 10) || 0,
+            autoTranspose: autoKeyBox.checked,
+            testDetune: testBox.checked,
+            selective: selectiveBox ? selectiveBox.checked : true,
+            selectiveCents: autoTune ? autoTune.selectiveCents : 6,
+            selectiveSoftCents: autoTune ? autoTune.selectiveSoftCents : 14,
+            spokenSung: spokenBox ? spokenBox.checked : false,
+            natural: naturalBox ? naturalBox.checked : true,      // gentle vibrato, quicker arrival on notes, steadier holds
+            adaptive: naturalBox ? naturalBox.checked : true      // rawer takes get a stronger, steadier correction
+        };
+        if (S) S.tuneOptions = { rootPc: options.rootPc, scale: options.scale, refCents: options.refCents };   // the harmony layer follows this key
+
+        // ---- listen line by line: allowed notes and strength per line (phrasebrain.js), handed to the engine as zones
+        let phraseRes = null;
+        if (phraseBox && phraseBox.checked && window.PhraseBrain && typeof createTuneEngine === "function" && (options.scale === "major" || options.scale === "minor")) {
+            try {
+                statusLine.textContent = "Listening line by line…";
+                await new Promise((r) => setTimeout(r, 30));
+                const eng = createTuneEngine(), mono = eng.mixDown(channels);
+                const tr = eng.trackClean(mono, vocal.sampleRate), notes = eng.segmentNotes(tr.midi);
+                const res = window.PhraseBrain.analyze({ notes, hopSec: tr.hop / vocal.sampleRate, key: { rootPc: options.rootPc, scale: options.scale }, refCents: options.refCents, totalSec: mono.length / vocal.sampleRate });
+                // only when most of the vocal already lives in this key: a vocal sung in a different key altogether is MOVED as a whole (the old way)
+                if (res.zones.length && !res.globalMismatch && res.keyCoverage >= 0.55) { options.zones = res.zones; options.autoTranspose = false; phraseRes = res; }
+            } catch (error) { console.warn("Line-by-line listening failed, using one key:", error); }
+        }
+        S.phraseResult = phraseRes;
+        showPhraseLines(phraseRes);
+
+        try {
+
+            const result = await window.VLTune.tuneVocal(
+                channels, vocal.sampleRate, options,
+                (fraction, label) => {
+                    statusLine.textContent = `${label}… ${Math.round(fraction * 100)}%`;
+                }
+            );
+
+            lastResult = result;
+            buildBuffers(result, vocal);
+            showResults(result);
+            if (result.selective) {
+                const s = result.selective;
+                const total = (s.corrected || 0) + (s.partial || 0) + (s.skipped || 0);
+                const spokenBit = s.spokenLifted
+                    ? ` Lifted ${s.spokenLifted} talk-sing line${s.spokenLifted === 1 ? "" : "s"} onto a note.`
+                    : "";
+                statusLine.textContent =
+                    total
+                        ? `Tuned ${s.corrected} notes, gently fixed ${s.partial}, left ${s.skipped} alone (natural takes stay natural).${spokenBit}`
+                        : "Pitch correction done.";
+            } else {
+                statusLine.textContent = "Pitch correction done.";
+            }
+
+        } catch (error) {
+
+            console.error(error);
+            statusLine.textContent = "Pitch correction failed. See the console for details.";
+
+        } finally {
+
+            running = false;
+            runButton.disabled = false;
+
+        }
+    });
+
+    function showPhraseLines(res) {
+        let box = document.getElementById("tune-lines");
+        if (!box) {
+            box = document.createElement("details"); box.id = "tune-lines"; box.className = "edit-summary"; box.hidden = true;
+            box.innerHTML = "<summary></summary><ul></ul>";
+            statusLine.parentNode.insertBefore(box, statusLine.nextSibling);
+        }
+        if (!res || !res.lines.length) { box.hidden = !res; if (res) { box.querySelector("summary").textContent = "Line by line: " + res.summary.lines + " lines, all fit the beat's key"; box.querySelector("ul").innerHTML = ""; } return; }
+        box.hidden = false; box.open = false;
+        box.querySelector("summary").textContent = "How each line was handled (" + res.lines.length + ")";
+        box.querySelector("ul").innerHTML = res.lines.map((l) => "<li>" + l.replace(/&/g, "&amp;").replace(/</g, "&lt;") + "</li>").join("");
+    }
+
+    function buildBuffers(result, vocal) {
+
+        const ctx = S.audioContext;
+        audioBuffers = { original: vocal };
+
+        for (const name of ["detuned", "tuned"]) {
+
+            const data = result.audio[name];
+            if (!data) continue;
+
+            const buffer = ctx.createBuffer(data.length, data[0].length, vocal.sampleRate);
+            data.forEach((channel, c) => buffer.copyToChannel(channel, c));
+            audioBuffers[name] = buffer;
+        }
+
+        // Hand the corrected vocal to the mix stage (level matching, automix).
+        S.tunedVocal = audioBuffers.tuned || null;
+
+        // Download link for the tuned vocal
+        if (downloadLink.dataset.url) URL.revokeObjectURL(downloadLink.dataset.url);
+        const url = URL.createObjectURL(toWav(result.audio.tuned, vocal.sampleRate));
+        downloadLink.href = url;
+        downloadLink.dataset.url = url;
+    }
+
+    // -----------------------------------------------------
+    // Results
+    // -----------------------------------------------------
+
+    function showResults(result) {
+
+        results.classList.remove("hidden");
+
+        const rows = [["original", "Original"]];
+        if (result.stats.detuned) rows.push(["detuned", "Detuned (test)"]);
+        rows.push(["tuned", "Corrected"]);
+
+        statsBody.innerHTML = "";
+
+        for (const [key, label] of rows) {
+            const s = result.stats[key];
+            const tr = document.createElement("tr");
+            if (key === "tuned") tr.className = "is-result";
+            tr.innerHTML =
+                `<th scope="row">${label}</th>` +
+                `<td>${s.inKeyPct.toFixed(1)}%</td>` +
+                `<td>${s.medianCents.toFixed(1)}</td>` +
+                `<td>${s.within25Pct.toFixed(1)}%</td>` +
+                `<td>${s.notesOutOfKey} / ${s.notes}</td>`;
+            statsBody.appendChild(tr);
+        }
+
+        document.querySelector(".swatch-detuned").classList.toggle("hidden", !result.audio.detuned);
+        $("tune-legend-detuned").classList.toggle("hidden", !result.audio.detuned);
+
+        // The "Detuned Test" button only exists when test mode made a detuned version.
+        const detunedButton = $("mode-detuned-btn");
+        if (detunedButton) detunedButton.classList.toggle("hidden", !result.audio.detuned);
+
+        // Don't stay stuck on a version that this run did not produce.
+        if (pitchMode === "detuned" && !audioBuffers.detuned) switchPitchMode("tuned");
+
+        // Warn when the vocal clearly belongs to a different key than the one chosen
+        const warning = $("tune-key-warning");
+        const fit = result.keyFit;
+        warning.classList.add("hidden");
+
+        // Only warn when nothing was done about it. If the whole vocal was moved into the key, the
+        // result note below already explains exactly what happened.
+        if (fit && fit.selectedPct < fit.bestPct - 0.05 && !result.transposeAuto && !result.transposeManual) {
+            const names = fit.best.map(k => `${NOTE_NAMES[k.root]} ${k.scale}`).join(" / ");
+            const chosen = `${NOTE_NAMES[result.options.rootPc]} ${result.options.scale}`;
+            warning.textContent =
+                `Check the key: ${Math.round(fit.bestPct * 100)}% of this vocal's notes fit ${names}, ` +
+                `but only ${Math.round(fit.selectedPct * 100)}% fit ${chosen}. ` +
+                `If ${chosen} is right for the beat, the vocal was sung in another key: tick "move the whole vocal into the beat's key" ` +
+                `above and run again. If the beat's key was detected wrongly, pick the right one above and run again, ` +
+                `otherwise notes that were right will be bent.`;
+            warning.classList.remove("hidden");
+        }
+
+        const t = result.stats.tuned;
+        let text;
+        if (result.selective) {
+            const s = result.selective;
+            text = s.corrected + s.partial === 0
+                ? `Selective mode: every note was already close to the scale (within ~${s.thresh} cents) — left the performance alone. `
+                : `Selective mode: pulled ${s.corrected} clearly-off note${s.corrected === 1 ? "" : "s"} onto the scale` +
+                  (s.partial ? `, eased ${s.partial} borderline note${s.partial === 1 ? "" : "s"}` : "") +
+                  (s.skipped ? `, left ${s.skipped} near-perfect note${s.skipped === 1 ? "" : "s"} untouched` : "") +
+                  `. `;
+        } else {
+            text = result.corrected === 0
+                ? "No note was more than 15 cents off the scale, so only fine tightening was applied. "
+                : `${result.corrected} of ${result.notes} notes were more than 15 cents off and were pulled onto the scale. `;
+        }
+
+        if (result.noiseClean && result.noiseClean.applied) text += " Retuning stirs up room noise inside the notes, so the noise between the voice's harmonics was lowered to match the quiet parts.";
+
+        // Singing feel: what was done to make a raw take sound sung
+        if (result.adaptive && result.adaptive.rawness >= 0.5) {
+            text += ` This was a raw take (only ${Math.round(result.adaptive.within25Pct)}% of the singing sat within 25 cents of a note), so notes were steadied and pulled in more firmly.`;
+        }
+        if (result.natural) {
+            const nf = result.natural, bits = [];
+            if (nf.vibratoAdded) bits.push(`a gentle vibrato on ${nf.vibratoAdded} held note${nf.vibratoAdded === 1 ? "" : "s"}`);
+            if (nf.onsetsTightened) bits.push(`cleaner starts on ${nf.onsetsTightened} note${nf.onsetsTightened === 1 ? "" : "s"}`);
+            if (nf.endsHeld) bits.push(`steadier ends on ${nf.endsHeld} note${nf.endsHeld === 1 ? "" : "s"}`);
+            if (bits.length) text += ` Natural feel: ${bits.join(", ")}.`;
+            if (nf.vibratoKept) text += ` Left your own vibrato on ${nf.vibratoKept} note${nf.vibratoKept === 1 ? "" : "s"}.`;
+        }
+
+        if (result.detuneEvents) {
+            const wrong = result.detuneEvents.filter(e => e.kind === "wrong-note").length;
+            text += `Test mode detuned ${result.detuneEvents.length} notes ` +
+                `(${wrong} pushed a semitone out of key). ` +
+                `A note pushed more than about 50 cents, or a wrong note sitting between two scale notes, ` +
+                `is snapped to the nearest valid note, which is not always the one the singer meant.`;
+        }
+
+        // Whole-vocal moves
+        const plural = (n) => `${Math.abs(n)} semitone${Math.abs(n) === 1 ? "" : "s"}`;
+        if (result.transposeManual) {
+            text += ` You moved the whole vocal ${result.transposeManual > 0 ? "up" : "down"} ${plural(result.transposeManual)}.`;
+        }
+        if (result.transposeAuto) {
+            const f = result.transposeFit;
+            text += ` Your vocal was sitting in a different key from the beat, so the whole vocal was moved ` +
+                `${result.transposeAuto > 0 ? "up" : "down"} ${plural(result.transposeAuto)}, which keeps your melody ` +
+                `(${Math.round(100 * f.before)}% of the notes fit the beat's key before, ${Math.round(100 * f.after)}% after). ` +
+                `If the beat's key above is wrong, untick the key-matching box and run again.`;
+        }
+
+        // What the smarter note chooser found out about this singer
+        if (result.biasCents) {
+            text += ` You sang about ${Math.abs(Math.round(result.biasCents))} cents ${result.biasCents < 0 ? "flat" : "sharp"} on average, ` +
+                `so notes between two scale notes were pulled the way you were aiming.`;
+        }
+        if (result.ambiguousNotes) {
+            text += ` ${result.ambiguousNotes} note${result.ambiguousNotes === 1 ? " was" : "s were"} close calls between two scale notes.`;
+        }
+
+        resultNote.textContent = text;
+
+        const first = result.contours.original.findIndex(v => !isNaN(v));
+        const hopSec = result.hop / result.sampleRate;
+        const duration = result.contours.original.length * hopSec;
+        scrollSlider.max = String(Math.max(0, duration - WINDOW_SECONDS).toFixed(2));
+        scrollSlider.value = String(Math.max(0, first * hopSec - 0.5).toFixed(2));
+
+        drawContour();
+    }
+
+    // -----------------------------------------------------
+    // Pitch contour chart
+    // -----------------------------------------------------
+
+    const WINDOW_SECONDS = 12;
+
+    scrollSlider.addEventListener("input", drawContour);
+    window.addEventListener("resize", () => { if (lastResult) drawContour(); });
+
+    function cssVar(name) {
+        return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    }
+
+    function drawContour() {
+
+        if (!lastResult) return;
+
+        const dpr = window.devicePixelRatio || 1;
+        const width = canvas.clientWidth;
+        const height = canvas.clientHeight;
+        if (!width) return;
+
+        canvas.width = Math.round(width * dpr);
+        canvas.height = Math.round(height * dpr);
+
+        const g = canvas.getContext("2d");
+        g.scale(dpr, dpr);
+        g.clearRect(0, 0, width, height);
+
+        const hopSec = lastResult.hop / lastResult.sampleRate;
+        const t0 = parseFloat(scrollSlider.value) || 0;
+        const k0 = Math.floor(t0 / hopSec);
+        const k1 = Math.min(lastResult.contours.original.length, Math.floor((t0 + WINDOW_SECONDS) / hopSec));
+
+        const series = [
+            ["original", "#8a8a94"],
+            ["detuned", cssVar("--vocal") || "#0099cc"],
+            ["tuned", cssVar("--accent") || "#ff5433"]
+        ].filter(([name]) => lastResult.contours[name]);
+
+        // Vertical range: what is on screen, padded
+        let lo = Infinity, hi = -Infinity;
+        for (const [name] of series) {
+            const c = lastResult.contours[name];
+            for (let k = k0; k < k1; k++) if (!isNaN(c[k])) { lo = Math.min(lo, c[k]); hi = Math.max(hi, c[k]); }
+        }
+        if (!isFinite(lo)) { lo = 55; hi = 70; }
+        lo = Math.floor(lo - 1.5);
+        hi = Math.ceil(hi + 1.5);
+
+        const left = 34, pad = 6;
+        const y = (m) => pad + (1 - (m - lo) / (hi - lo)) * (height - 2 * pad);
+        const x = (k) => left + ((k - k0) / Math.max(1, k1 - k0)) * (width - left - pad);
+
+        // Scale notes as guide lines
+        const o = lastResult.options;
+        const ref = o.refCents / 100;
+        const MODES = { major: [0, 2, 4, 5, 7, 9, 11], minor: [0, 2, 3, 5, 7, 8, 10], dorian: [0, 2, 3, 5, 7, 9, 10], mixolydian: [0, 2, 4, 5, 7, 9, 10], lydian: [0, 2, 4, 6, 7, 9, 11], phrygian: [0, 1, 3, 5, 7, 8, 10] };
+        const degrees = MODES[o.scale] || MODES.major;
+        g.font = "11px system-ui, sans-serif";
+        g.textBaseline = "middle";
+
+        for (let m = lo; m <= hi; m++) {
+            const pc = ((m % 12) + 12) % 12;
+            if (!degrees.some(d => (o.rootPc + d) % 12 === pc)) continue;
+            const yy = y(m + ref);
+            g.strokeStyle = (pc === o.rootPc) ? "rgba(255,84,51,0.45)" : "rgba(255,255,255,0.10)";
+            g.lineWidth = 1;
+            g.beginPath(); g.moveTo(left, yy); g.lineTo(width - pad, yy); g.stroke();
+            g.fillStyle = "#9a9aa3";
+            g.fillText(NOTE_NAMES[pc], 4, yy);
+        }
+
+        // Contours
+        for (const [name, colour] of series) {
+            const c = lastResult.contours[name];
+            g.strokeStyle = colour;
+            g.lineWidth = name === "tuned" ? 2 : 1.25;
+            g.globalAlpha = name === "tuned" ? 1 : 0.8;
+            g.beginPath();
+            let pen = false;
+            for (let k = k0; k < k1; k++) {
+                if (isNaN(c[k])) { pen = false; continue; }
+                if (pen) g.lineTo(x(k), y(c[k])); else { g.moveTo(x(k), y(c[k])); pen = true; }
+            }
+            g.stroke();
+        }
+        g.globalAlpha = 1;
+    }
+
+// =====================================================
+// ENHANCED PITCH CORRECTION TRANSPORT
+// =====================================================
+//
+// Features:
+// - Play / Pause
+// - Stop
+// - Original / Corrected A-B switching
+// - -5 second rewind
+// - -2 second rewind
+// - +5 second forward
+// - 4-second loop
+// - Position display
+// - Keeps vocal aligned to the beat
+// =====================================================
+
+
+const pitchPlayBtn =
+    $("pitch-play-btn");
+
+const pitchStopBtn =
+    $("pitch-stop-btn");
+
+const modeCorrectedBtn =
+    $("mode-corrected-btn");
+
+const modeOriginalBtn =
+    $("mode-original-btn");
+
+const modeDetunedBtn =
+    $("mode-detuned-btn");
+
+const rewind5sBtn =
+    $("pitch-rewind-5s");
+
+const rewind2sBtn =
+    $("pitch-rewind-2s");
+
+const forward5sBtn =
+    $("pitch-forward-5s");
+
+const pitchLoopToggle =
+    $("pitch-loop-toggle");
+
+const pitchPositionDisplay =
+    $("pitch-position");
+
+
+let pitchNodes = [];
+
+let pitchPlaying = false;
+
+let pitchMode = "tuned";
+
+let pitchPosition = 0;
+
+let pitchStartedAt = 0;
+
+let pitchStartPosition = 0;
+
+let pitchAnimationFrame = null;
+
+let pitchLoopStart = 0;
+
+
+// =====================================================
+// FORMAT TIME
+// =====================================================
+
+function formatPitchTime(seconds) {
+
+    seconds = Math.max(
+        0,
+        seconds || 0
+    );
+
+    const minutes =
+        Math.floor(seconds / 60);
+
+    const secs =
+        Math.floor(seconds % 60)
+            .toString()
+            .padStart(2, "0");
+
+    return `${minutes}:${secs}`;
+}
+
+
+// =====================================================
+// UPDATE POSITION DISPLAY
+// =====================================================
+
+function updatePitchPosition(time) {
+
+    pitchPosition =
+        Math.max(
+            0,
+            time || 0
+        );
+
+    if (pitchPositionDisplay) {
+
+        pitchPositionDisplay.textContent =
+            formatPitchTime(pitchPosition);
+
+    }
+
+    // Keep the pitch contour view following playback.
+    if (lastResult && scrollSlider) {
+
+        const maxScroll =
+            parseFloat(scrollSlider.max) || 0;
+
+        const desired =
+            Math.min(
+                Math.max(
+                    0,
+                    pitchPosition - WINDOW_SECONDS / 2
+                ),
+                maxScroll
+            );
+
+        scrollSlider.value =
+            String(desired);
+
+        drawContour();
+    }
+}
+
+
+// =====================================================
+// CURRENT PLAYBACK POSITION
+// =====================================================
+
+function getPitchCurrentPosition() {
+
+    if (!pitchPlaying) {
+        return pitchPosition;
+    }
+
+    const ctx =
+        S.audioContext;
+
+    return Math.max(
+        0,
+        pitchStartPosition +
+        (ctx.currentTime - pitchStartedAt)
+    );
+}
+
+
+// =====================================================
+// STOP AUDIO NODES
+// =====================================================
+
+function stopPitchNodes() {
+
+    pitchNodes.forEach(node => {
+
+        try {
+            node.onended = null;
+            node.stop();
+        } catch (error) {
+            // Already stopped.
+        }
+
+    });
+
+    pitchNodes = [];
+}
+
+
+// =====================================================
+// UPDATE PLAY BUTTON
+// =====================================================
+
+function updatePitchPlayButton() {
+
+    if (!pitchPlayBtn) return;
+
+    pitchPlayBtn.innerHTML =
+        pitchPlaying
+            ? VLI("pause", 16) + " Pause"
+            : VLI("play", 16) + " Play";
+}
+
+
+// =====================================================
+// STOP PLAYBACK
+// =====================================================
+
+function stopPitchPlayback() {
+
+    stopPitchNodes();
+
+    pitchPlaying = false;
+
+    cancelAnimationFrame(
+        pitchAnimationFrame
+    );
+
+    updatePitchPlayButton();
+
+}
+
+
+// =====================================================
+// START PLAYBACK
+// =====================================================
+
+function startPitchPlayback(
+    startPosition = pitchPosition
+) {
+
+    if (
+        !S.audioContext ||
+        !S.beatBuffer ||
+        !audioBuffers[pitchMode]
+    ) {
+        return;
+    }
+
+    const ctx =
+        S.audioContext;
+
+    if (ctx.state === "suspended") {
+        ctx.resume();
+    }
+
+    stopPitchNodes();
+
+    const beat =
+        S.beatBuffer;
+
+    const vocal =
+        audioBuffers[pitchMode];
+
+    const duration =
+        beat.duration;
+
+    // Clamp position.
+    startPosition =
+        Math.max(
+            0,
+            Math.min(
+                duration - 0.01,
+                startPosition
+            )
+        );
+
+    const now =
+        ctx.currentTime + 0.05;
+
+    pitchStartedAt =
+        now;
+
+    pitchStartPosition =
+        startPosition;
+
+    pitchPosition =
+        startPosition;
+
+
+    // -----------------------------------------------------
+    // BEAT
+    // -----------------------------------------------------
+
+    const beatSource =
+        ctx.createBufferSource();
+
+    beatSource.buffer =
+        beat;
+
+    const beatGain =
+        ctx.createGain();
+
+    beatGain.gain.value =
+        0.75;
+
+    beatSource
+        .connect(beatGain)
+        .connect(ctx.destination);
+
+
+    // -----------------------------------------------------
+    // VOCAL
+    // -----------------------------------------------------
+
+    const vocalSource =
+        ctx.createBufferSource();
+
+    vocalSource.buffer =
+        vocal;
+
+    vocalSource.connect(
+        ctx.destination
+    );
+
+
+    // -----------------------------------------------------
+    // ALIGN VOCAL WITH BEAT
+    // -----------------------------------------------------
+
+    const vocalTime =
+        startPosition -
+        S.vocalOffset;
+
+
+    // Beat begins immediately at
+    // the selected beat position.
+
+    beatSource.start(
+        now,
+        startPosition
+    );
+
+
+    // If the vocal should have already
+    // started before the selected beat
+    // position, compensate for it.
+
+    if (vocalTime >= 0) {
+
+        vocalSource.start(
+            now,
+            vocalTime
+        );
+
+    } else {
+
+        vocalSource.start(
+            now + (-vocalTime),
+            0
+        );
+
+    }
+
+
+    // -----------------------------------------------------
+    // STORE PLAYBACK STATE
+    // -----------------------------------------------------
+
+    pitchNodes = [
+        beatSource,
+        vocalSource
+    ];
+
+    pitchPlaying = true;
+
+    updatePitchPlayButton();
+
+
+    // -----------------------------------------------------
+    // END OF TRACK
+    // -----------------------------------------------------
+
+    beatSource.onended = () => {
+
+        if (!pitchPlaying) {
+            return;
+        }
+
+        pitchPosition =
+            duration;
+
+        stopPitchPlayback();
+
+        updatePitchPosition(
+            duration
+        );
+
+    };
+
+
+    // -----------------------------------------------------
+    // UPDATE PLAYHEAD
+    // -----------------------------------------------------
+
+    animatePitchPlayback();
+}
+
+
+// =====================================================
+// PAUSE
+// =====================================================
+
+function pausePitchPlayback() {
+
+    if (!pitchPlaying) {
+        return;
+    }
+
+    pitchPosition =
+        getPitchCurrentPosition();
+
+    stopPitchPlayback();
+
+    updatePitchPosition(
+        pitchPosition
+    );
+}
+
+
+// =====================================================
+// PLAY / PAUSE BUTTON
+// =====================================================
+
+pitchPlayBtn.addEventListener(
+    "click",
+    () => {
+
+        if (pitchPlaying) {
+
+            pausePitchPlayback();
+
+        } else {
+
+            startPitchPlayback(
+                pitchPosition
+            );
+
+        }
+
+    }
+);
+
+
+// =====================================================
+// STOP
+// =====================================================
+
+pitchStopBtn.addEventListener(
+    "click",
+    () => {
+
+        stopPitchPlayback();
+
+        pitchPosition = 0;
+
+        pitchLoopStart = 0;
+
+        updatePitchPosition(0);
+
+    }
+);
+
+
+// =====================================================
+// A/B MODE SWITCH
+// =====================================================
+
+function switchPitchMode(mode) {
+
+    if (
+        mode === "tuned" &&
+        !audioBuffers.tuned
+    ) {
+        return;
+    }
+
+    if (
+        mode === "original" &&
+        !audioBuffers.original
+    ) {
+        return;
+    }
+
+    if (
+        mode === "detuned" &&
+        !audioBuffers.detuned
+    ) {
+        return;
+    }
+
+    const wasPlaying =
+        pitchPlaying;
+
+    const currentPosition =
+        getPitchCurrentPosition();
+
+    pitchMode =
+        mode;
+
+
+    modeCorrectedBtn
+        .classList
+        .toggle(
+            "active",
+            mode === "tuned"
+        );
+
+    modeOriginalBtn
+        .classList
+        .toggle(
+            "active",
+            mode === "original"
+        );
+    
+    modeDetunedBtn
+    .classList
+    .toggle(
+        "active",
+        mode === "detuned"
+    );
+
+    if (wasPlaying) {
+
+        startPitchPlayback(
+            currentPosition
+        );
+
+    } else {
+
+        updatePitchPosition(
+            currentPosition
+        );
+
+    }
+
+}
+
+
+modeCorrectedBtn.addEventListener(
+    "click",
+    () => switchPitchMode("tuned")
+);
+
+modeOriginalBtn.addEventListener(
+    "click",
+    () => switchPitchMode("original")
+);
+modeDetunedBtn.addEventListener(
+    "click",
+    () => switchPitchMode("detuned")
+);
+
+
+// =====================================================
+// JUMP / REWIND
+// =====================================================
+
+function jumpPitchPlayback(
+    seconds
+) {
+
+    const current =
+        getPitchCurrentPosition();
+
+    const duration =
+        S.beatBuffer
+            ? S.beatBuffer.duration
+            : 0;
+
+    const target =
+        Math.max(
+            0,
+            Math.min(
+                duration - 0.01,
+                current + seconds
+            )
+        );
+
+
+    // When playing, restart both
+    // sources from the new position.
+
+    if (pitchPlaying) {
+
+        startPitchPlayback(
+            target
+        );
+
+    } else {
+
+        pitchPosition =
+            target;
+
+        updatePitchPosition(
+            target
+        );
+
+    }
+
+}
+
+
+rewind5sBtn.addEventListener(
+    "click",
+    () => jumpPitchPlayback(-5)
+);
+
+rewind2sBtn.addEventListener(
+    "click",
+    () => jumpPitchPlayback(-2)
+);
+
+forward5sBtn.addEventListener(
+    "click",
+    () => jumpPitchPlayback(5)
+);
+
+
+// =====================================================
+// 4 SECOND LOOP
+// =====================================================
+
+pitchLoopToggle.addEventListener(
+    "change",
+    () => {
+
+        if (
+            !pitchLoopToggle.checked
+        ) {
+            return;
+        }
+
+        // Start the loop at the
+        // current listening position.
+
+        pitchLoopStart =
+            getPitchCurrentPosition();
+
+    }
+);
+
+
+// =====================================================
+// PLAYBACK ANIMATION
+// =====================================================
+
+function animatePitchPlayback() {
+
+    if (!pitchPlaying) {
+        return;
+    }
+
+    const current =
+        getPitchCurrentPosition();
+
+
+    // -----------------------------------------------------
+    // LOOP
+    // -----------------------------------------------------
+
+    if (
+        pitchLoopToggle.checked &&
+        current >= pitchLoopStart + 4
+    ) {
+
+        startPitchPlayback(
+            pitchLoopStart
+        );
+
+        return;
+
+    }
+
+
+    // -----------------------------------------------------
+    // END
+    // -----------------------------------------------------
+
+    if (
+        S.beatBuffer &&
+        current >=
+        S.beatBuffer.duration
+    ) {
+
+        stopPitchPlayback();
+
+        updatePitchPosition(
+            S.beatBuffer.duration
+        );
+
+        return;
+
+    }
+
+
+    updatePitchPosition(
+        current
+    );
+
+
+    pitchAnimationFrame =
+        requestAnimationFrame(
+            animatePitchPlayback
+        );
+
+}
+
+    // -----------------------------------------------------
+    // WAV encoding for the download
+    // -----------------------------------------------------
+
+    function toWav(channels, sampleRate) {
+
+        const n = channels[0].length, nch = channels.length;
+        const buffer = new ArrayBuffer(44 + n * nch * 2);
+        const view = new DataView(buffer);
+
+        const text = (offset, s) => { for (let i = 0; i < s.length; i++) view.setUint8(offset + i, s.charCodeAt(i)); };
+
+        text(0, "RIFF"); view.setUint32(4, 36 + n * nch * 2, true);
+        text(8, "WAVE"); text(12, "fmt "); view.setUint32(16, 16, true);
+        view.setUint16(20, 1, true); view.setUint16(22, nch, true);
+        view.setUint32(24, sampleRate, true); view.setUint32(28, sampleRate * nch * 2, true);
+        view.setUint16(32, nch * 2, true); view.setUint16(34, 16, true);
+        text(36, "data"); view.setUint32(40, n * nch * 2, true);
+
+        let offset = 44;
+        for (let i = 0; i < n; i++) {
+            for (let c = 0; c < nch; c++) {
+                const v = Math.max(-1, Math.min(1, channels[c][i]));
+                view.setInt16(offset, v < 0 ? v * 32768 : v * 32767, true);
+                offset += 2;
+            }
+        }
+
+        return new Blob([buffer], { type: "audio/wav" });
+    }
+});
